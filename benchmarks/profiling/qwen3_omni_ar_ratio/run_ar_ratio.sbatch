@@ -22,19 +22,24 @@ source .venv/bin/activate
 export HF_HOME=/scratch/yf3005/.huggingface
 export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
+export SEEDTTS_SIM_CACHE_DIR=/scratch/yf3005/.huggingface/seedtts_sim
+export UTMOS_CACHE_DIR=/scratch/yf3005/.huggingface/utmos
+ASR_PORT=8010
 
 echo "node=$(hostname) job=$SLURM_JOB_ID start=$(date) commit=$(git rev-parse --short HEAD)"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 for i in $(seq 1 240); do
   grep -q "^EXIT=0" /scratch/yf3005/logs/omni_profile/venv_install.log 2>/dev/null \
     && grep -q "^EXIT=0" /scratch/yf3005/logs/omni_profile/hf_download2.log 2>/dev/null \
-    && grep -q "^EXIT=0" /scratch/yf3005/logs/omni_profile/seedtts_prepare.log 2>/dev/null && break
+    && grep -q "^EXIT=0" /scratch/yf3005/logs/omni_profile/seedtts_prepare.log 2>/dev/null \
+    && grep -q "^EXIT=0" /scratch/yf3005/logs/omni_profile/eval_assets.log 2>/dev/null && break
   [ $i -eq 1 ] && echo "waiting for venv install and checkpoint download to finish"
   sleep 15
 done
 grep -q "^EXIT=0" /scratch/yf3005/logs/omni_profile/venv_install.log || { echo "venv install not finished"; exit 1; }
 grep -q "^EXIT=0" /scratch/yf3005/logs/omni_profile/hf_download2.log || { echo "checkpoint download not finished"; exit 1; }
 grep -q "^EXIT=0" /scratch/yf3005/logs/omni_profile/seedtts_prepare.log || { echo "seedtts dataset not prepared"; exit 1; }
+grep -q "^EXIT=0" /scratch/yf3005/logs/omni_profile/eval_assets.log || { echo "ASR model and WER/SIM/UTMOS assets not prepared"; exit 1; }
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
 case "$GPU_NAME" in
   *H200*) CONFIG=examples/configs/qwen3_omni_colocated_h200.yaml ;;
@@ -75,10 +80,12 @@ curl -sf "$BASE_URL/health" | grep -q healthy || { echo "server never became hea
 echo "== warmup"
 python "$PROFILE_DIR/ar_ratio_workload.py" --base-url $BASE_URL --run-id warmup --event-dir "$RUN_DIR/warmup" --mode text --num-requests 3 --concurrency 1 --max-tokens 128 --no-profile
 
-SEEDTTS_META=zhaochenyang20/seed-tts-eval-arrow
+# CI protocol: the seedtts-50 subset with voice-clone references, 256 new tokens, temperature 0.7, talker defaults.
+SEEDTTS_META=zhaochenyang20/seed-tts-eval-50-arrow
 SEEDTTS_SAMPLES=50
+CASES="seedtts_c1:1 seedtts_c8:8 seedtts_c16:16"
 
-# The official SeedTTS speech benchmark (benchmarks/eval/benchmark_omni_seedtts.py, generate-only) wrapped in one request profile; its warmup requests are the first <concurrency> admissions and are skipped in the report.
+# One official generate-only run wrapped in a request profile; its warmup requests are the first <concurrency> admissions and are skipped in the report.
 run_seedtts_case() {
   local run_id=$1 conc=$2
   local case_dir=$RUN_DIR/$run_id
@@ -87,7 +94,7 @@ run_seedtts_case() {
   curl -sf -X POST "$BASE_URL/start_request_profile" -H 'Content-Type: application/json' \
     -d "{\"run_id\":\"$run_id\",\"event_dir\":\"$case_dir/events\",\"event_buffer_capacity\":65536}" || { echo "start_request_profile failed"; return 1; }
   python -m benchmarks.eval.benchmark_omni_seedtts \
-    --generate-only --disable-tqdm --fingerprint \
+    --generate-only --disable-tqdm --fingerprint --voice-clone \
     --meta "$SEEDTTS_META" --max-samples "$SEEDTTS_SAMPLES" \
     --max-concurrency "$conc" --warmup "$conc" \
     --model qwen3-omni --base-url "$BASE_URL" \
@@ -114,9 +121,54 @@ run_case() {
   python -m sglang_omni.profiler "$RUN_DIR/$run_id/events" --format table > "$RUN_DIR/$run_id/stage_breakdown.txt" 2>&1
 }
 
-run_seedtts_case seedtts_c1 1
-run_seedtts_case seedtts_c16 16
-run_seedtts_case seedtts_c8 8
+for entry in $CASES; do
+  run_seedtts_case "${entry%%:*}" "${entry##*:}"
+done
 run_case text_c1 text 1 8 128
 
+# WER needs the GPU for Qwen3-ASR, so the omni server goes down first, as in CI.
+cleanup
+trap - EXIT
+sleep 20
+nvidia-smi --query-gpu=memory.used --format=csv
+
+echo "== asr server"
+setsid sgl-omni serve --model-path Qwen/Qwen3-ASR-1.7B --host 127.0.0.1 --port $ASR_PORT > "$RUN_DIR/asr_server.log" 2>&1 &
+ASR_PID=$!
+cleanup_asr() {
+  echo "stopping asr server pgid=$ASR_PID"
+  kill -TERM -- -"$ASR_PID" 2>/dev/null
+  sleep 10
+  kill -KILL -- -"$ASR_PID" 2>/dev/null
+}
+trap cleanup_asr EXIT
+for i in $(seq 1 60); do
+  curl -sf "http://127.0.0.1:$ASR_PORT/health" | grep -q healthy && { echo "asr server healthy after $((i * 15))s"; break; }
+  kill -0 "$ASR_PID" 2>/dev/null || { echo "asr server exited early"; tail -30 "$RUN_DIR/asr_server.log"; exit 1; }
+  sleep 15
+done
+
+for entry in $CASES; do
+  run_id=${entry%%:*}
+  echo "== wer $run_id"
+  python -m benchmarks.eval.benchmark_omni_seedtts --transcribe-only --disable-tqdm \
+    --meta "$SEEDTTS_META" --output-dir "$RUN_DIR/$run_id/seedtts" --model qwen3-omni --lang en \
+    --port $ASR_PORT --asr-model-path Qwen/Qwen3-ASR-1.7B --asr-concurrency 4
+done
+cleanup_asr
+trap - EXIT
+sleep 10
+
+for entry in $CASES; do
+  run_id=${entry%%:*}
+  echo "== similarity $run_id"
+  python -m benchmarks.eval.benchmark_omni_seedtts --similarity-only --disable-tqdm \
+    --meta "$SEEDTTS_META" --output-dir "$RUN_DIR/$run_id/seedtts" --model qwen3-omni --device cuda:0
+  echo "== utmos $run_id"
+  python -m benchmarks.eval.benchmark_omni_seedtts --utmos-only --disable-tqdm \
+    --meta "$SEEDTTS_META" --output-dir "$RUN_DIR/$run_id/seedtts" --model qwen3-omni --device cuda:0
+done
+
+echo "== summary"
+python "$PROFILE_DIR/summarize_cases.py" "$RUN_DIR" $CASES | tee "$RUN_DIR/summary.md"
 echo "done $(date)"
