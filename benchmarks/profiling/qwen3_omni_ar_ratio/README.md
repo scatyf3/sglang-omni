@@ -4,7 +4,7 @@ Measures how much of a speech-mode Qwen3-Omni request's end-to-end latency is sp
 
 - `ar_ratio_workload.py` starts a request profile on a running server, sends text or audio requests at a fixed concurrency with `modalities: ["text", "audio"]`, stops the profile and waits for the event sidecars.
 - `ar_ratio_report.py` reads the event JSONL directory and prints per-stage spans plus `ar_sum_ratio` (thinker AR span + talker AR span over end-to-end) and `ar_union_ratio` (wall-clock time with at least one AR stage active over end-to-end). TTFT, TTFA and the code2wav tail after the talker finishes are reported alongside.
-- `run_ar_ratio.sbatch` is the slurm driver for the NYU Torch cluster: one H200 or H100, colocated single-GPU server, warmup, then five cases (text c1, audio-in c1, text 512 tokens c1, text c4, text c8). Outputs land in the gitignored `.profiling-runs/qwen3_omni_ar_ratio/run_<jobid>/`.
+- `run_ar_ratio.sbatch` is the slurm driver for the NYU Torch cluster: one H200 or H100, colocated single-GPU server, then the official SeedTTS speech benchmark (`benchmarks/eval/benchmark_omni_seedtts.py --generate-only`, 50 samples, speaker Ethan, temperature 0.7, max 256 new tokens) at concurrency 1, 16 and 8 inside a request profile, plus one hand-written text case as a sanity check. Each SeedTTS run skips its own warmup requests in the report. Outputs land in the gitignored `.profiling-runs/qwen3_omni_ar_ratio/run_<jobid>/`.
 
 ```bash
 sbatch benchmarks/profiling/qwen3_omni_ar_ratio/run_ar_ratio.sbatch

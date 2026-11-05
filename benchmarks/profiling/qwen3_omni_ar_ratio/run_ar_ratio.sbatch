@@ -27,12 +27,14 @@ echo "node=$(hostname) job=$SLURM_JOB_ID start=$(date) commit=$(git rev-parse --
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 for i in $(seq 1 240); do
   grep -q "^EXIT=0" /scratch/yf3005/logs/omni_profile/venv_install.log 2>/dev/null \
-    && grep -q "^EXIT=0" /scratch/yf3005/logs/omni_profile/hf_download2.log 2>/dev/null && break
+    && grep -q "^EXIT=0" /scratch/yf3005/logs/omni_profile/hf_download2.log 2>/dev/null \
+    && grep -q "^EXIT=0" /scratch/yf3005/logs/omni_profile/seedtts_prepare.log 2>/dev/null && break
   [ $i -eq 1 ] && echo "waiting for venv install and checkpoint download to finish"
   sleep 15
 done
 grep -q "^EXIT=0" /scratch/yf3005/logs/omni_profile/venv_install.log || { echo "venv install not finished"; exit 1; }
 grep -q "^EXIT=0" /scratch/yf3005/logs/omni_profile/hf_download2.log || { echo "checkpoint download not finished"; exit 1; }
+grep -q "^EXIT=0" /scratch/yf3005/logs/omni_profile/seedtts_prepare.log || { echo "seedtts dataset not prepared"; exit 1; }
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
 case "$GPU_NAME" in
   *H200*) CONFIG=examples/configs/qwen3_omni_colocated_h200.yaml ;;
@@ -72,7 +74,35 @@ curl -sf "$BASE_URL/health" | grep -q healthy || { echo "server never became hea
 
 echo "== warmup"
 python "$PROFILE_DIR/ar_ratio_workload.py" --base-url $BASE_URL --run-id warmup --event-dir "$RUN_DIR/warmup" --mode text --num-requests 3 --concurrency 1 --max-tokens 128 --no-profile
-python "$PROFILE_DIR/ar_ratio_workload.py" --base-url $BASE_URL --run-id warmup_audio --event-dir "$RUN_DIR/warmup" --mode audio --num-requests 2 --concurrency 1 --max-tokens 128 --no-profile
+
+SEEDTTS_META=zhaochenyang20/seed-tts-eval-arrow
+SEEDTTS_SAMPLES=50
+
+# The official SeedTTS speech benchmark (benchmarks/eval/benchmark_omni_seedtts.py, generate-only) wrapped in one request profile; its warmup requests are the first <concurrency> admissions and are skipped in the report.
+run_seedtts_case() {
+  local run_id=$1 conc=$2
+  local case_dir=$RUN_DIR/$run_id
+  echo "== case $run_id seedtts c=$conc samples=$SEEDTTS_SAMPLES"
+  mkdir -p "$case_dir"
+  curl -sf -X POST "$BASE_URL/start_request_profile" -H 'Content-Type: application/json' \
+    -d "{\"run_id\":\"$run_id\",\"event_dir\":\"$case_dir/events\",\"event_buffer_capacity\":65536}" || { echo "start_request_profile failed"; return 1; }
+  python -m benchmarks.eval.benchmark_omni_seedtts \
+    --generate-only --disable-tqdm --fingerprint \
+    --meta "$SEEDTTS_META" --max-samples "$SEEDTTS_SAMPLES" \
+    --max-concurrency "$conc" --warmup "$conc" \
+    --model qwen3-omni --base-url "$BASE_URL" \
+    --output-dir "$case_dir/seedtts"
+  curl -sf -X POST "$BASE_URL/stop_request_profile" -H 'Content-Type: application/json' -d '{}'
+  python - "$case_dir/events" "$PROFILE_DIR" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[2])
+from ar_ratio_workload import wait_for_sidecars
+print("sidecars:", [s.get("complete") for s in wait_for_sidecars(Path(sys.argv[1]), timeout_s=300)])
+PY
+  python "$PROFILE_DIR/ar_ratio_report.py" "$case_dir/events" --skip-first "$conc" --out "$case_dir/ar_ratio.json" | tee "$case_dir/ar_ratio.txt"
+  python -m sglang_omni.profiler "$case_dir/events" --format table > "$case_dir/stage_breakdown.txt" 2>&1
+}
 
 run_case() {
   local run_id=$1 mode=$2 conc=$3 n=$4 max_tokens=$5
@@ -84,10 +114,9 @@ run_case() {
   python -m sglang_omni.profiler "$RUN_DIR/$run_id/events" --format table > "$RUN_DIR/$run_id/stage_breakdown.txt" 2>&1
 }
 
+run_seedtts_case seedtts_c1 1
+run_seedtts_case seedtts_c16 16
+run_seedtts_case seedtts_c8 8
 run_case text_c1 text 1 8 128
-run_case audio_c1 audio 1 8 128
-run_case text_c1_long text 1 4 512
-run_case text_c4 text 4 16 128
-run_case text_c8 text 8 16 128
 
 echo "done $(date)"
