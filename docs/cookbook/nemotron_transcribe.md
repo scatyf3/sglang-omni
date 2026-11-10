@@ -85,6 +85,21 @@ The first requests compile kernels and capture encoder shapes. Exclude this warm
 
 For c=1, set both decoder limits to `1`. For long recordings, start with the default encoder batch cap rather than this profile's cap of `32`.
 
+## Decode with the native MTP draft
+
+The checkpoint ships one multi-token-prediction layer (`llm.mtp.*`) that proposes several next tokens from the decoder's last hidden state. The decoder verifies them the EAGLE way; no second checkpoint is needed, the draft loads from the target path:
+
+```bash
+sgl-omni serve \
+  --model-path nvidia/Nemotron-3.5-Transcribe-30B-A4B \
+  --model-name nemotron-transcribe \
+  --asr.engine.speculative_algorithm NEXTN \
+  --mem-fraction-static 0.85 \
+  --port 8000
+```
+
+`speculative_num_steps` 3, `speculative_eagle_topk` 1 and `speculative_num_draft_tokens` 4 are the defaults; the single MTP layer is replayed once per step. Mamba layers snapshot their SSM and convolution state per draft token during verification and keep the snapshot of the last accepted token, so rejected drafts leave no trace. Send the form field `return_spec_tokens_details=true` to read `spec_accept_length` on a response. Offline, greedy verification accepts about 7.3 of 8 chained drafts on LibriSpeech test-clean transcripts (`benchmarks/profiling/nemotron_transcribe_mtp/`).
+
 ## Validate the integration
 
 The unit suite covers pipeline registration, checkpoint conversion, tensor mapping, placeholder counts, request validation, text streaming, mel features, rotary positions, encoder padding, and graph replay across changed inputs.
