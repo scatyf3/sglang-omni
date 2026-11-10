@@ -171,8 +171,6 @@ class NemotronTranscribeEngineBuilder(AsrEngineBuilder[NemotronTranscribeRequest
                 "Nemotron Transcribe speculative decoding serves the checkpoint's "
                 f"native MTP layer through EAGLE or NEXTN, not {algorithm}"
             )
-        elif overrides.get("tp_size", 1) != 1:
-            raise ValueError("Nemotron Transcribe MTP decoding requires tp_size 1")
         else:
             pass
         draft_model_path = overrides.get("speculative_draft_model_path")
