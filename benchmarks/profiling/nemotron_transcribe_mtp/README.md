@@ -51,3 +51,31 @@ The served acceptance matches the offline measurement above (MTP3 3.8 to 3.9, MT
 | end to end | 216.2 ms | 148.7 ms |
 
 The draft cuts decode by 56% (131.7 to 58.5 ms); prefill grows by 5 ms for the draft's own extend over the prompt. Prefill is now the larger half of a request, so the next lever on single-stream latency is the encoder and prefill, not decode.
+
+## Reference sweep on one H200 (2026-11-11, bf16, pre-LM encoder on, `run_mtp_sweep.sbatch`)
+
+seed-tts-eval-50 English, three measured repeats per concurrency (150 requests), corpus WER 0.0060 in every row, transcripts identical with and without the draft. `MTP7` is `--asr.engine.speculative_algorithm NEXTN` with 7 steps and 8 draft tokens.
+
+| concurrency | mode | RTFx | latency p50 | latency p95 |
+|---|---|---|---|---|
+| 1 | baseline | 36.2 | 0.124 s | 0.158 s |
+| 1 | MTP7 | 52.2 | 0.085 s | 0.096 s |
+| 8 | baseline | 81.6 | 0.430 s | 0.653 s |
+| 8 | MTP7 | 158.0 | 0.212 s | 0.282 s |
+| 16 | baseline | 121.3 | 0.584 s | 0.965 s |
+| 16 | MTP7 | 260.8 | 0.249 s | 0.300 s |
+
+### Stage breakdown by the model's three parts (per-request spans, mean over the measured requests)
+
+The decoder is the autoregressive part; `decoder prefill` is its pass over the prompt and `decoder decode` its token-by-token loop. On one GPU the Parallel Expert Encoder runs in the pre-LM encoder thread before the decoder sees the request, so its time sits inside `other` (request build, queue, dispatch); at concurrency 1 that whole bucket is 3.4 ms, which bounds the encoder. The CTC timestamp heads are not served.
+
+| concurrency | mode | decoder prefill | decoder decode | decoder (AR share) | other | end to end |
+|---|---|---|---|---|---|---|
+| 1 | baseline | 54.4 ms (45%) | 65.9 ms (53%) | 120.3 ms (97.2%) | 3.4 ms | 123.8 ms |
+| 1 | MTP7 | 58.0 ms (68%) | 24.0 ms (28%) | 82.0 ms (95.8%) | 3.6 ms | 85.6 ms |
+| 8 | baseline | 57.3 ms (15%) | 318.6 ms (78%) | 375.9 ms (92.5%) | 30.4 ms | 406.3 ms |
+| 8 | MTP7 | 61.3 ms (30%) | 80.3 ms (38%) | 141.6 ms (68.2%) | 66.5 ms | 208.1 ms |
+| 16 | baseline | 56.0 ms (9%) | 523.0 ms (82%) | 579.0 ms (91.4%) | 48.0 ms | 626.9 ms |
+| 16 | MTP7 | 61.3 ms (24%) | 99.2 ms (37%) | 160.6 ms (61.9%) | 98.5 ms | 259.1 ms |
+
+The draft cuts decode by 2.7x at concurrency 1, 4.0x at 8 and 5.3x at 16; prefill grows by 4 to 5 ms for the draft's extend over the prompt and becomes the larger part of a single-stream request. At concurrency 8 and 16 the time a request spends between admission and its prefill (`other`) grows once decode is cheap, so the queue, not the decoder, is the next thing to look at under load. Unlike the L40S run, the gain keeps rising with concurrency on the H200.
