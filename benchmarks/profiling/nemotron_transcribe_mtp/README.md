@@ -37,3 +37,17 @@ seed-tts-eval-50 English through `/v1/audio/transcriptions`, one measured repeat
 | 16 | MTP7 | 132.1 | 0.447 s | 0.722 s | - |
 
 The served acceptance matches the offline measurement above (MTP3 3.8 to 3.9, MTP8 7.3 to 7.4). The 30B-A4B decoder is memory-bound on L40S even at concurrency 16, so verifying eight tokens per forward keeps paying: the draft roughly doubles throughput at concurrency 8 and 16 and cuts single-stream latency by a third.
+
+### Stage breakdown at concurrency 1 (request events, 49 measured requests, server-side spans)
+
+`PROFILE=1` makes the smoke script record request events and run `transcribe_report.py`. The pre-LM encoder is off under tensor parallelism, so audio encoding happens inside the prefill forward and is counted in prefill.
+
+| | baseline | MTP7 |
+|---|---|---|
+| admission to prefill (build + queue) | 6.3 ms (2.9%) | 6.7 ms (4.5%) |
+| prefill (incl. audio encoder) | 77.5 ms (36.5%) | 82.6 ms (56.0%) |
+| decode | 131.7 ms (60.2%) | 58.5 ms (38.9%) |
+| AR share (prefill + decode) | 209.1 ms (96.7%) | 141.1 ms (94.9%) |
+| end to end | 216.2 ms | 148.7 ms |
+
+The draft cuts decode by 56% (131.7 to 58.5 ms); prefill grows by 5 ms for the draft's own extend over the prompt. Prefill is now the larger half of a request, so the next lever on single-stream latency is the encoder and prefill, not decode.
