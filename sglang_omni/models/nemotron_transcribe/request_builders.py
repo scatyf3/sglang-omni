@@ -152,6 +152,7 @@ def make_scheduler_adapters(
             model_specific_data={
                 "num_audio_tokens": n_audio,
                 "audio_fingerprint": prepared.fingerprint,
+                "request_id": payload.request_id,
             },
         )
         audio_item.set_pad_value()
@@ -236,6 +237,7 @@ def make_scheduler_adapters(
                     "prompt_tokens": len(data.prompt_token_ids or []),
                     "completion_tokens": len(output_ids),
                 },
+                "spec_tokens_details": data.spec_tokens_details,
                 "modality": "text",
             },
         )
