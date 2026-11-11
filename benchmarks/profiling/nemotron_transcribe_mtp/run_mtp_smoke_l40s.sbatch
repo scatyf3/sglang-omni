@@ -9,7 +9,8 @@
 #SBATCH --mem=120G
 #SBATCH --time=03:00:00
 #SBATCH --output=/scratch/yf3005/logs/nemo_mtp/smoke_%j.log
-# Same smoke on 2x L40S (48 GB): the decoder runs tensor-parallel over both GPUs with a smaller context. Serve with NEXTN, transcribe seed-tts-eval-50 at c=1,
+# Same smoke on 2x L40S (48 GB): the decoder runs tensor-parallel over both GPUs with a smaller context; the pre-LM
+# encoder is off because its per-rank asynchronous admission breaks TP lockstep. Serve with NEXTN, transcribe seed-tts-eval-50 at c=1,
 # read spec_accept_length from one response, then repeat without the draft for the WER baseline.
 set -uo pipefail
 
@@ -38,7 +39,7 @@ serve_and_bench() {
   local tag=$1; shift
   echo "== $tag: launch"
   setsid sgl-omni serve --model-path $MODEL --model-name nemotron-transcribe \
-    --mem-fraction-static 0.88 --host 127.0.0.1 --port $PORT --asr.tp_size 2 --asr.factory.context_length 16384 --asr.engine.max_running_requests 8 "$@" > "$RUN_DIR/server_$tag.log" 2>&1 &
+    --mem-fraction-static 0.90 --host 127.0.0.1 --port $PORT --asr.tp_size 2 --asr.gpu "[0, 1]" --asr.factory.context_length 16384 --asr.factory.max_new_tokens 1024 --asr.factory.enable_pre_lm_encoder false --asr.engine.max_running_requests 8 "$@" > "$RUN_DIR/server_$tag.log" 2>&1 &
   local server_pid=$!
   local ok=0
   for i in $(seq 1 260); do
@@ -67,6 +68,10 @@ serve_and_bench() {
   return $((1 - ok))
 }
 
-serve_and_bench mtp --asr.engine.speculative_algorithm NEXTN
-serve_and_bench baseline
+# MTP_STEPS / MTP_DRAFT override the chain depth (default 3 steps, 4 draft tokens).
+MTP_ARGS="--asr.engine.speculative_algorithm NEXTN"
+[ -n "${MTP_STEPS:-}" ] && MTP_ARGS="$MTP_ARGS --asr.engine.speculative_num_steps $MTP_STEPS --asr.engine.speculative_num_draft_tokens ${MTP_DRAFT:-$((MTP_STEPS + 1))}"
+for mode in ${MODES:-mtp baseline}; do
+  if [ "$mode" = mtp ]; then serve_and_bench "mtp${MTP_STEPS:+_s$MTP_STEPS}" $MTP_ARGS; else serve_and_bench baseline; fi
+done
 echo "done $(date)"

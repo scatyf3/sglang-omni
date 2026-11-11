@@ -137,6 +137,9 @@ class SGLangGenerationEngineBuilder(ABC, Generic[RequestDataT]):
         dtype: str = "bfloat16",
         server_args_overrides: Mapping[str, object] | None = None,
         total_gpu_memory_fraction: float | None = None,
+        tp_rank: int = 0,
+        tp_size: int = 1,
+        nccl_port: int | None = None,
     ) -> "OmniScheduler[RequestDataT]":
         from sglang_omni.platforms import current_platform
         from sglang_omni.scheduling import bootstrap as scheduling_bootstrap
@@ -189,6 +192,11 @@ class SGLangGenerationEngineBuilder(ABC, Generic[RequestDataT]):
             **self.generation_defaults(dtype=dtype),
         )
         self.adjust_overrides(overrides)
+        if tp_size > 1:
+            # The stage worker owns one rank per process; SGLang shards the decoder across the group.
+            overrides["tp_size"] = tp_size
+        else:
+            pass
         if "context_length" in overrides:
             if not self.supports_context_length_override:
                 raise ValueError(
@@ -277,6 +285,8 @@ class SGLangGenerationEngineBuilder(ABC, Generic[RequestDataT]):
             )
 
         infra_kwargs["before_memory_pool"] = before_memory_pool
+        infra_kwargs["tp_rank"] = tp_rank
+        infra_kwargs["nccl_port"] = nccl_port
         if total_gpu_memory_fraction is not None:
             infra_kwargs["total_gpu_memory_fraction"] = total_gpu_memory_fraction
         else:
