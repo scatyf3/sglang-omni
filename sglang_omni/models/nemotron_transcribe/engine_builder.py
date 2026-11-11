@@ -18,6 +18,7 @@ from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.server_args import ServerArgs
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.models.nemotron_transcribe.config import (
     DEFAULT_MAX_RUNNING_REQUESTS,
     EncoderCompileMode,
@@ -30,6 +31,9 @@ from sglang_omni.models.nemotron_transcribe.hf_config import (
     MODEL_ARCH_OVERRIDE,
     NemotronTranscribeConfig,
     register_nemotron_transcribe_hf_config,
+)
+from sglang_omni.models.nemotron_transcribe.model_runner import (
+    NemotronTranscribeModelRunner,
 )
 from sglang_omni.models.nemotron_transcribe.request_builders import (
     NemotronTranscribeRequestData,
@@ -52,6 +56,7 @@ from sglang_omni.scheduling.engine_factory import (
     SchedulerExtras,
 )
 from sglang_omni.scheduling.generation_batch_policy import CudaGraphBackend
+from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +167,13 @@ class NemotronTranscribeEngineBuilder(AsrEngineBuilder[NemotronTranscribeRequest
             "cuda_graph_backend_prefill": CudaGraphBackend.DISABLED,
         }
 
+    def make_model_runner(
+        self,
+        model_worker: ModelWorker,
+        output_proc: SGLangOutputProcessor,
+    ) -> NemotronTranscribeModelRunner:
+        return NemotronTranscribeModelRunner(model_worker, output_proc)
+
     def adjust_overrides(self, overrides: dict[str, object]) -> None:
         algorithm = overrides.get("speculative_algorithm")
         if algorithm is None:
@@ -204,6 +216,16 @@ class NemotronTranscribeEngineBuilder(AsrEngineBuilder[NemotronTranscribeRequest
         else:
             pass
         self.context_length = int(server_args.context_length)
+        if server_args.tp_size > 1 and self.enable_pre_lm_encoder:
+            # Deferred admission waits on each rank's own encoder future, so the ranks would admit a request on
+            # different scheduler steps and break TP lockstep; the in-forward encoder runs on every rank alike.
+            logger.warning(
+                f"Nemotron Transcribe pre-LM encoder disabled for tp_size={server_args.tp_size}; "
+                "audio is encoded inside the decoder forward"
+            )
+            self.enable_pre_lm_encoder = False
+        else:
+            pass
         initialize_mamba_selective_state_update_backend(server_args)
 
     def setup_model_resources(
