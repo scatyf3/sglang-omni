@@ -39,7 +39,7 @@ serve_and_bench() {
   local tag=$1; shift
   echo "== $tag: launch"
   setsid sgl-omni serve --model-path $MODEL --model-name nemotron-transcribe \
-    --mem-fraction-static 0.90 --host 127.0.0.1 --port $PORT --asr.tp_size 2 --asr.gpu "[0, 1]" --asr.factory.context_length 16384 --asr.factory.max_new_tokens 1024 --asr.factory.enable_pre_lm_encoder false --asr.engine.max_running_requests 8 "$@" > "$RUN_DIR/server_$tag.log" 2>&1 &
+    --mem-fraction-static 0.90 --host 127.0.0.1 --port $PORT --asr.tp_size 2 --asr.gpu "[0, 1]" --asr.factory.context_length 16384 --asr.factory.max_new_tokens 1024 --asr.factory.enable_pre_lm_encoder false --asr.engine.max_running_requests 16 "$@" > "$RUN_DIR/server_$tag.log" 2>&1 &
   local server_pid=$!
   local ok=0
   for i in $(seq 1 260); do
@@ -55,7 +55,7 @@ serve_and_bench() {
     python -m benchmarks.eval.benchmark_asr_seedtts \
       --port $PORT --model-path nemotron-transcribe \
       --meta zhaochenyang20/seed-tts-eval-50-arrow --lang en --max-samples 0 \
-      --concurrencies 1 --repeats 1 --warmup --disable-resource-monitor \
+      --concurrencies "${CONCS:-1}" --repeats 1 --warmup --disable-resource-monitor \
       --output "$RUN_DIR/asr_bench_$tag.json" 2>&1 | tee "$RUN_DIR/asr_bench_$tag.txt" | tail -20
     echo "== $tag: accept len lines from the server log"
     grep -o "accept len: [0-9.]*, accept rate: [0-9.]*" "$RUN_DIR/server_$tag.log" | tail -5

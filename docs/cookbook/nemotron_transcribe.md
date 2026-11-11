@@ -87,7 +87,7 @@ For c=1, set both decoder limits to `1`. For long recordings, start with the def
 
 ## Decode with the native MTP draft
 
-The checkpoint ships one multi-token-prediction layer (`llm.mtp.*`) that proposes several next tokens from the decoder's last hidden state. The decoder verifies them the EAGLE way; no second checkpoint is needed, the draft loads from the target path:
+The checkpoint ships one multi-token-prediction layer (`llm.mtp.*`) that proposes several next tokens from the decoder's last hidden state. The decoder verifies them the EAGLE way; no second checkpoint is needed, the draft loads from the target path. Tensor parallelism (`--asr.tp_size 2 --asr.gpu "[0, 1]"`) works with the draft and turns the pre-LM encoder off, since its per-rank deferred admission would break TP lockstep:
 
 ```bash
 sgl-omni serve \
@@ -98,7 +98,7 @@ sgl-omni serve \
   --port 8000
 ```
 
-`speculative_num_steps` 3, `speculative_eagle_topk` 1 and `speculative_num_draft_tokens` 4 are the defaults; the single MTP layer is replayed once per step. Mamba layers snapshot their SSM and convolution state per draft token during verification and keep the snapshot of the last accepted token, so rejected drafts leave no trace. Send the form field `return_spec_tokens_details=true` to read `spec_accept_length` on a response. Offline, greedy verification accepts about 7.3 of 8 chained drafts on LibriSpeech test-clean transcripts (`benchmarks/profiling/nemotron_transcribe_mtp/`).
+`speculative_num_steps` 3, `speculative_eagle_topk` 1 and `speculative_num_draft_tokens` 4 are the defaults; the single MTP layer is replayed once per step, and acceptance decays slowly enough that `speculative_num_steps` 7 with `speculative_num_draft_tokens` 8 gains more (on 2x L40S, seed-tts-eval-50 at concurrency 1: baseline RTFx 21.5, 3 steps 27.5, 7 steps 30.6, with corpus WER unchanged at 0.0060; at concurrency 8 and 16 the 7-step draft doubles throughput). Mamba layers snapshot their SSM and convolution state per draft token during verification and keep the snapshot of the last accepted token, so rejected drafts leave no trace. Send the form field `return_spec_tokens_details=true` to read `spec_accept_length` on a response. Offline, greedy verification accepts about 7.3 of 8 chained drafts on LibriSpeech test-clean transcripts (`benchmarks/profiling/nemotron_transcribe_mtp/`).
 
 ## Validate the integration
 
