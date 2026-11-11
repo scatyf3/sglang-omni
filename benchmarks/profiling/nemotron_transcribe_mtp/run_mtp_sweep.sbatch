@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=nemo_mtp_sweep_h200
+#SBATCH --job-name=nemo_mtp_sweep
 #SBATCH --account=torch_pr_111_tandon_advanced
-#SBATCH --partition=h200_tandon,h200_public
+#SBATCH --partition=h200_tandon,h200_public,h100_tandon
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -9,7 +9,8 @@
 #SBATCH --mem=150G
 #SBATCH --time=03:00:00
 #SBATCH --output=/scratch/yf3005/logs/nemo_mtp/sweep_%j.log
-# Reference sweep on one H200 (141 GB; a single 80 GB H100 cannot hold the bf16 weights plus the draft and a KV pool):
+# Reference sweep on one H200 or H100. An 80 GB card holds the bf16 decoder, the draft and the encoder with about
+# 4 GB to spare, so it runs with a higher static fraction, a 16k context and at most 8 running requests:
 # baseline and the 7-step MTP draft, pre-LM encoder on, c=1/8/16 with three repeats and request events for the stage breakdown. Serve with NEXTN, transcribe seed-tts-eval-50,
 # read spec_accept_length from one response, then repeat without the draft for the WER baseline.
 set -uo pipefail
@@ -31,6 +32,13 @@ export SGLANG_OMNI_STARTUP_TIMEOUT=3600
 
 echo "node=$(hostname) job=${SLURM_JOB_ID:-} start=$(date) commit=$(git rev-parse --short HEAD)"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
+GPU_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
+if [ "$GPU_MIB" -lt 100000 ]; then
+  SERVE_ARGS="--mem-fraction-static 0.93 --asr.factory.context_length 16384 --asr.factory.max_new_tokens 1024 --asr.engine.max_running_requests 8"
+else
+  SERVE_ARGS="--mem-fraction-static 0.85 --asr.engine.max_running_requests 16"
+fi
+echo "serve args: $SERVE_ARGS"
 CLIP=$(python - <<'PY'
 import glob, io, pyarrow.parquet as pq, soundfile
 rows = pq.read_table(glob.glob("/scratch/yf3005/.huggingface/hub/datasets--zhaochenyang20--seed-tts-eval-50-arrow/snapshots/*/data/en-*.parquet")[0]).to_pylist()
@@ -44,7 +52,7 @@ serve_and_bench() {
   local tag=$1; shift
   echo "== $tag: launch"
   setsid sgl-omni serve --model-path $MODEL --model-name nemotron-transcribe \
-    --mem-fraction-static 0.85 --host 127.0.0.1 --port $PORT --asr.engine.max_running_requests 16 "$@" > "$RUN_DIR/server_$tag.log" 2>&1 &
+    $SERVE_ARGS --host 127.0.0.1 --port $PORT "$@" > "$RUN_DIR/server_$tag.log" 2>&1 &
   local server_pid=$!
   local ok=0
   for i in $(seq 1 260); do
