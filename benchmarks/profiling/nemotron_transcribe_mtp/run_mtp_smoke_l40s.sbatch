@@ -55,7 +55,7 @@ serve_and_bench() {
     python -m benchmarks.eval.benchmark_asr_seedtts \
       --port $PORT --model-path nemotron-transcribe \
       --meta zhaochenyang20/seed-tts-eval-50-arrow --lang en --max-samples 0 \
-      --concurrencies "${CONCS:-1}" --repeats 1 --warmup --disable-resource-monitor \
+      --concurrencies "${CONCS:-1}" --repeats "${REPEATS:-1}" --warmup --disable-resource-monitor \
       ${PROFILE:+--profile-events --profile-event-dir "$RUN_DIR/events_$tag"} \
       --output "$RUN_DIR/asr_bench_$tag.json" 2>&1 | tee "$RUN_DIR/asr_bench_$tag.txt" | tail -20
     if [ -n "${PROFILE:-}" ]; then
