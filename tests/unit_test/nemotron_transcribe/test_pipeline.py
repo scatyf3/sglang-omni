@@ -31,6 +31,10 @@ def test_pipeline_is_one_whole_file_asr_stage() -> None:
 def test_architecture_registers_with_the_model_registry() -> None:
     configs = import_pipeline_configs("sglang_omni.models", "config")
     assert configs[ARCHITECTURE] is NemotronTranscribePipelineConfig
+    assert (
+        configs["Nemotron3_5TranscribeForConditionalGeneration"]
+        is NemotronTranscribePipelineConfig
+    )
 
 
 def test_audio_placeholder_counts_cover_one_hour_uploads() -> None:
