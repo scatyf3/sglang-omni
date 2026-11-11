@@ -193,7 +193,6 @@ class SGLangGenerationEngineBuilder(ABC, Generic[RequestDataT]):
         )
         self.adjust_overrides(overrides)
         if tp_size > 1:
-            # The stage worker owns one rank per process; SGLang shards the decoder across the group.
             overrides["tp_size"] = tp_size
         else:
             pass

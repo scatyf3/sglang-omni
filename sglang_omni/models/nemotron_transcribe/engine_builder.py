@@ -60,7 +60,6 @@ from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputP
 
 logger = logging.getLogger(__name__)
 
-# The checkpoint's single MTP layer is replayed as a chain; one step per draft token keeps the verify batch small.
 MTP_DEFAULT_OVERRIDES = {
     "speculative_num_steps": 3,
     "speculative_eagle_topk": 1,
@@ -193,7 +192,6 @@ class NemotronTranscribeEngineBuilder(AsrEngineBuilder[NemotronTranscribeRequest
             )
         else:
             pass
-        # The shim directory carries the NemotronH config the draft's ModelConfig can parse.
         overrides["speculative_draft_model_path"] = self.checkpoint_dir
         overrides["speculative_draft_model_revision"] = None
         for key, value in MTP_DEFAULT_OVERRIDES.items():
@@ -217,8 +215,6 @@ class NemotronTranscribeEngineBuilder(AsrEngineBuilder[NemotronTranscribeRequest
             pass
         self.context_length = int(server_args.context_length)
         if server_args.tp_size > 1 and self.enable_pre_lm_encoder:
-            # Deferred admission waits on each rank's own encoder future, so the ranks would admit a request on
-            # different scheduler steps and break TP lockstep; the in-forward encoder runs on every rank alike.
             logger.warning(
                 f"Nemotron Transcribe pre-LM encoder disabled for tp_size={server_args.tp_size}; "
                 "audio is encoded inside the decoder forward"
