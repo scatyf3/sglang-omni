@@ -104,6 +104,7 @@ class NemotronTranscribeEngineBuilder(AsrEngineBuilder[NemotronTranscribeRequest
         compile_perception: bool,
         perception_cuda_graphs: bool,
         perception_compile_mode: EncoderCompileMode,
+        checkpoint_revision: str | None,
     ) -> None:
         if perception_cuda_graphs and not compile_perception:
             raise ValueError("perception_cuda_graphs requires compile_perception=true")
@@ -126,6 +127,7 @@ class NemotronTranscribeEngineBuilder(AsrEngineBuilder[NemotronTranscribeRequest
         self.compile_perception = compile_perception
         self.perception_cuda_graphs = perception_cuda_graphs
         self.perception_compile_mode = perception_compile_mode
+        self.checkpoint_revision = checkpoint_revision
         self.tokenizer: PreTrainedTokenizerBase | None = None
         self.hf_config: NemotronTranscribeConfig | None = None
         self.audio_encoder_service: NemotronTranscribePreLMEncoderService | None = None
@@ -134,7 +136,9 @@ class NemotronTranscribeEngineBuilder(AsrEngineBuilder[NemotronTranscribeRequest
 
     def resolve_checkpoint(self, model_path: str) -> str:
         register_nemotron_transcribe_hf_config()
-        checkpoint_directory = Path(resolve_model_path(model_path))
+        checkpoint_directory = Path(
+            resolve_model_path(model_path, revision=self.checkpoint_revision)
+        )
         checkpoint_config = json.loads(
             (checkpoint_directory / "config.json").read_text()
         )
