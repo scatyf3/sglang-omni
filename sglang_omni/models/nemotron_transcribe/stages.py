@@ -41,6 +41,7 @@ def create_nemotron_transcribe_executor(
     mem_fraction_static: float | None = None,
     server_args_overrides: Mapping[str, object] | None = None,
 ) -> OmniScheduler[NemotronTranscribeRequestData]:
+    revision = (server_args_overrides or {}).get("revision")
     return NemotronTranscribeEngineBuilder(
         max_new_tokens=max_new_tokens,
         context_length=context_length,
@@ -60,6 +61,7 @@ def create_nemotron_transcribe_executor(
         perception_cuda_graphs=perception_cuda_graphs,
         perception_compile_mode=perception_compile_mode,
         perception_fp8=perception_fp8,
+        checkpoint_revision=revision if isinstance(revision, str) else None,
     ).build(
         model_path,
         device=device,
