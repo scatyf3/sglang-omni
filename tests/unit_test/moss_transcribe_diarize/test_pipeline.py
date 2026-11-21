@@ -11,6 +11,7 @@ import httpx
 import pytest
 import torch
 from huggingface_hub.errors import RepositoryNotFoundError
+from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
 from sglang_omni.models.moss_transcribe_diarize import (
     engine_builder,
@@ -36,12 +37,17 @@ from sglang_omni.scheduling.generation_batch_policy import (
 from sglang_omni.serve.server_warmup import TranscriptionWarmupRequest
 from sglang_omni.speculative.dflash_draft import (
     DRAFT_ARCHITECTURE,
+    SELECTOR_DRAFT_ARCHITECTURE,
     ReducedVocabularyDFlashWorker,
 )
 from sglang_omni.utils.imports import import_string
 
 
-def make_moss_engine_builder() -> MossTranscribeDiarizeEngineBuilder:
+def make_moss_engine_builder(
+    *,
+    enable_async_decode: bool | None = True,
+    prefill_coalesce_after_builds_during_decode: bool | None = True,
+) -> MossTranscribeDiarizeEngineBuilder:
     return MossTranscribeDiarizeEngineBuilder(
         max_running_requests=16,
         max_new_tokens=None,
@@ -51,13 +57,15 @@ def make_moss_engine_builder() -> MossTranscribeDiarizeEngineBuilder:
         encoder_cache_size_bytes=0,
         enable_torch_compile=False,
         torch_compile_max_bs=4,
-        enable_async_decode=True,
+        enable_async_decode=enable_async_decode,
+        enable_plain_fallback=False,
         async_decode_min_batch_size=2,
+        prefill_drain_below_batch_size=None,
         prefill_coalesce_requests=0,
         prefill_coalesce_wait_ms=0.0,
         prefill_coalesce_when_idle=True,
         prefill_coalesce_requires_pending_builds=True,
-        prefill_coalesce_after_builds_during_decode=True,
+        prefill_coalesce_after_builds_during_decode=prefill_coalesce_after_builds_during_decode,
         encoder_chunk_buckets=[1],
         encoder_torch_compile=False,
         encoder_max_batch_size=2,
@@ -411,6 +419,7 @@ def test_factory_compiles_encoder_and_skips_cuda_graph_when_flag_on(
     scheduler_kwargs = calls["scheduler_kwargs"][0]
     assert scheduler_kwargs["enable_async_decode"] is True
     assert scheduler_kwargs["async_decode_min_batch_size"] == 1
+    assert scheduler_kwargs["prefill_drain_below_batch_size"] is None
     assert scheduler_kwargs["prefill_coalesce_requests"] == 4
     assert scheduler_kwargs["prefill_coalesce_wait_ms"] == 12.0
     assert scheduler_kwargs["prefill_coalesce_when_idle"] is True
@@ -474,7 +483,19 @@ def test_factory_context_length_override_uses_final_server_value(
     assert adapter_kwargs["speculative_reserve_tokens"] == 0
 
 
-def write_speculators_config(directory: Path) -> None:
+SELECTOR_DRAFT_FIELDS = {
+    "speculators_model_type": "dflash2",
+    "draft_vocab_size": 151936,
+    "conv_kernel_size": 2,
+    "conv_group_size": 16,
+    "selector_rank": 256,
+    "selector_top_k": 16,
+}
+
+
+def write_speculators_config(
+    directory: Path, draft_fields: dict[str, str | int] | None = None
+) -> None:
     (directory / "config.json").write_text(
         json.dumps(
             {
@@ -487,17 +508,38 @@ def write_speculators_config(directory: Path) -> None:
                 "mask_token_id": 151705,
                 "block_size": 8,
                 "transformer_layer_config": {"hidden_size": 1024},
+                **(draft_fields or {}),
             }
         )
     )
 
 
+@pytest.mark.parametrize(
+    ("draft_fields", "draft_architecture", "worker_class"),
+    [
+        pytest.param(
+            None, DRAFT_ARCHITECTURE, ReducedVocabularyDFlashWorker, id="dflash"
+        ),
+        pytest.param(
+            SELECTOR_DRAFT_FIELDS,
+            SELECTOR_DRAFT_ARCHITECTURE,
+            DFlashWorkerV2,
+            id="dflash2",
+        ),
+    ],
+)
+@pytest.mark.parametrize("enable_plain_fallback", [False, True])
 def test_factory_serves_a_draft_on_the_synchronous_verify_loop(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    enable_plain_fallback: bool,
+    draft_fields: dict[str, str | int] | None,
+    draft_architecture: str,
+    worker_class: type[DFlashWorkerV2],
 ) -> None:
-    """Async decode under a draft needs an overlap opt-in this runner lacks, and SGLang
-    cannot read the speculators config, so the worker class and the flat copy must both
-    reach the build, and the copy must not outlive it.
+    """Unset, async decode stays off under a draft, where it means speculative overlap;
+    SGLang cannot read the speculators config, so the worker class and the flat copy must
+    both reach the build, and the copy must not outlive it.
     """
     calls = stub_factory_env(monkeypatch, want_cuda_graph=False)
     monkeypatch.setattr(engine_builder.current_platform, "is_cuda", lambda: True)
@@ -543,29 +585,38 @@ def test_factory_serves_a_draft_on_the_synchronous_verify_loop(
         "make_moss_transcribe_diarize_scheduler_adapters",
         capture_adapters,
     )
-    write_speculators_config(tmp_path)
+    write_speculators_config(tmp_path, draft_fields)
 
     create_sglang_moss_transcribe_diarize_executor(
         "OpenMOSS-Team/MOSS-Transcribe-Diarize",
+        enable_plain_fallback=enable_plain_fallback,
         server_args_overrides={
             "speculative_algorithm": "DFLASH",
             "speculative_draft_model_path": str(tmp_path),
             "speculative_draft_model_revision": "pinned",
+            "enable_torch_compile": True,
         },
     )
 
-    assert draft_configs[0]["architectures"] == [DRAFT_ARCHITECTURE]
+    assert draft_configs[0]["architectures"] == [draft_architecture]
     assert not Path(str(server_args_kwargs["speculative_draft_model_path"])).exists()
     assert server_args_kwargs["speculative_draft_model_revision"] is None
     assert infrastructure_kwargs["supports_speculative_decoding"] is True
-    assert (
-        infrastructure_kwargs["speculative_worker_class"]
-        is ReducedVocabularyDFlashWorker
+    assert infrastructure_kwargs["speculative_worker_class"] is worker_class
+    assert server_args_kwargs["enable_torch_compile"] is False
+    assert infrastructure_kwargs["enable_async_decode"] is False
+    assert server_args_kwargs["disable_overlap_schedule"] is True
+    assert adapter_kwargs["speculative_reserve_tokens"] == (
+        0 if enable_plain_fallback else 16
     )
-    assert adapter_kwargs["speculative_reserve_tokens"] == 16
     scheduler_kwargs = calls["scheduler_kwargs"][0]
     assert scheduler_kwargs["enable_async_decode"] is False
     assert scheduler_kwargs["async_prefill"] is False
+    assert scheduler_kwargs["model_runner"].speculative_ignores_request_seed is True
+    assert (
+        scheduler_kwargs["model_runner"].speculative_repetition_penalty_owner
+        == "verify_logits"
+    )
 
 
 def test_a_failed_build_leaves_no_draft_copy_behind(
@@ -640,6 +691,144 @@ def test_unservable_speculative_settings_are_refused_before_the_engine_starts(
         make_moss_engine_builder().adjust_overrides(dict(overrides))
 
 
+@pytest.mark.parametrize("with_draft", [False, True])
+def test_torch_compile_is_turned_off_only_under_the_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, with_draft: bool
+) -> None:
+    """On SGLang 0.5.23 compile made the draft about four times slower at concurrency 1, while it still speeds up decode without a draft."""
+    monkeypatch.setattr(engine_builder.current_platform, "is_cuda", lambda: True)
+    write_speculators_config(tmp_path)
+    overrides: dict[str, object] = {"enable_torch_compile": True}
+    if with_draft:
+        overrides["speculative_algorithm"] = "DFLASH"
+        overrides["speculative_draft_model_path"] = str(tmp_path)
+    else:
+        pass
+    builder = make_moss_engine_builder()
+
+    builder.adjust_overrides(overrides)
+
+    assert overrides["enable_torch_compile"] is not with_draft
+    if with_draft:
+        builder.draft_checkpoint.cleanup()
+    else:
+        pass
+
+
+@pytest.mark.parametrize(
+    ("requested", "with_draft", "expected"),
+    [
+        (None, False, True),
+        (None, True, False),
+        (True, True, True),
+        (False, False, False),
+    ],
+)
+def test_speculative_overlap_is_an_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    requested: bool | None,
+    with_draft: bool,
+    expected: bool,
+) -> None:
+    """Ordinary decode defaults to async; under a draft async decode means speculative overlap, so it runs only when the operator asks for it."""
+    monkeypatch.setattr(engine_builder.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        engine_builder.request_builders,
+        "make_moss_transcribe_diarize_stream_output_builder",
+        Mock(),
+    )
+    write_speculators_config(tmp_path)
+    builder = make_moss_engine_builder(enable_async_decode=requested)
+    builder.full_prefill_enabled = True
+    overrides: dict[str, object] = (
+        {
+            "speculative_algorithm": "DFLASH",
+            "speculative_draft_model_path": str(tmp_path),
+        }
+        if with_draft
+        else {}
+    )
+
+    builder.adjust_overrides(overrides)
+
+    scheduler_kwargs = builder.extra_scheduler_kwargs()
+    assert scheduler_kwargs["enable_async_decode"] is expected
+    # note (wilsonzheng0327): SGLang builds the draft worker for one loop or the other, so the infrastructure must hear the same choice as the scheduler.
+    if with_draft:
+        assert builder.infra_kwargs()["enable_async_decode"] is expected
+        assert overrides["disable_overlap_schedule"] is not expected
+        assert scheduler_kwargs["async_prefill"] is False
+        builder.draft_checkpoint.cleanup()
+    else:
+        assert builder.infra_kwargs() == {}
+        assert scheduler_kwargs["async_prefill"] is expected
+
+
+@pytest.mark.parametrize(
+    ("requested", "with_draft", "expected"),
+    [
+        (None, False, True),
+        (None, True, False),
+        (True, True, True),
+        (False, False, False),
+    ],
+)
+def test_prefill_hold_during_decode_defaults_off_with_a_draft(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    requested: bool | None,
+    with_draft: bool,
+    expected: bool,
+) -> None:
+    """By default a prefill is held during decode only without a draft; an explicit setting reaches the scheduler unchanged."""
+    monkeypatch.setattr(engine_builder.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        engine_builder.request_builders,
+        "make_moss_transcribe_diarize_stream_output_builder",
+        Mock(),
+    )
+    write_speculators_config(tmp_path)
+    builder = make_moss_engine_builder(
+        prefill_coalesce_after_builds_during_decode=requested
+    )
+    overrides: dict[str, object] = (
+        {
+            "speculative_algorithm": "DFLASH",
+            "speculative_draft_model_path": str(tmp_path),
+        }
+        if with_draft
+        else {}
+    )
+
+    builder.adjust_overrides(overrides)
+
+    assert (
+        builder.extra_scheduler_kwargs()["prefill_coalesce_after_builds_during_decode"]
+        is expected
+    )
+    if with_draft:
+        builder.draft_checkpoint.cleanup()
+    else:
+        pass
+
+
+def test_builder_runner_opts_into_speculative_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scheduler refuses speculative overlap unless the runner the builder hands it opts in."""
+    monkeypatch.setattr(
+        engine_builder.MossTranscribeDiarizeModelRunner,
+        "__init__",
+        lambda self, *args: None,
+    )
+
+    runner = make_moss_engine_builder().make_model_runner(Mock(), Mock())
+
+    assert isinstance(runner, engine_builder.MossTranscribeDiarizeModelRunner)
+    assert runner.supports_speculative_async_decode is True
+
+
 def test_dflash_worker_reaches_the_decoder_through_the_outer_model() -> None:
     """The worker addresses the outer model; its decoder owns the head and the capture."""
     captured_layer_ids: list[list[int]] = []
@@ -707,6 +896,13 @@ def test_server_warmup_request_is_a_second_of_audio_to_transcribe() -> None:
 
     assert isinstance(request, TranscriptionWarmupRequest)
     assert (len(audio), sample_rate, request.max_new_tokens) == (16000, 16000, 8)
+
+
+def test_pipeline_config_leaves_prefill_hold_during_decode_to_the_builder() -> None:
+    """The shipped config must leave the hold during decode unset, so a drafted server does not hold prefills during decode."""
+    config = MossTranscribeDiarizePipelineConfig(model_path="dummy")
+
+    assert config.stages[0].factory.prefill_coalesce_after_builds_during_decode is None
 
 
 def test_factory_preserves_trimmed_fbank_opt_out(
