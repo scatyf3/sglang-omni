@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -38,7 +39,7 @@ func (o *OpenAI) Info() BackendInfo { return BackendInfo{ID: o.preset.ID} }
 
 type oaMessage struct {
 	Role    string `json:"role"`
-	Content string `json:"content"`
+	Content any    `json:"content"` // a string, or parts with an image
 }
 
 type oaUsage struct {
@@ -64,13 +65,27 @@ func (o *OpenAI) body(req Request, model string, stream, streamUsage, extra bool
 		msgs = withJSONInstruction(msgs, req.Schema, o.preset.JSONMode != JSONSchemaMode || req.Schema == nil)
 	}
 	oms := make([]oaMessage, len(msgs))
+	last := -1
 	for i, m := range msgs {
 		oms[i] = oaMessage{Role: string(m.Role), Content: m.Content}
+		if m.Role == User {
+			last = i
+		}
+	}
+	if len(req.Images) > 0 && last >= 0 {
+		oms[last].Content = o.withImages(msgs[last].Content, req.Images, req.ImagesRequired)
+	}
+	p := o.preset
+	switch t := req.Thinking; {
+	case t != nil:
+		p.Generation.Thinking.Mode, p.Generation.Thinking.Effort, p.Generation.Thinking.Budget = t.Mode, t.Effort, t.Budget
+	case req.InputChars > 0 && req.InputChars < p.Generation.ThinkOffUnder:
+		p.Generation.Thinking.Mode = ThinkDefault
 	}
 	b := map[string]any{}
 	// A thinking mode the user chose replaces the preset's (ExtraBody).
-	if extra && o.preset.Generation.Thinking.Mode == ThinkDefault {
-		for k, v := range o.preset.ExtraBody {
+	if extra && p.Generation.Thinking.Mode == ThinkDefault {
+		for k, v := range p.ExtraBody {
 			b[k] = v
 		}
 	}
@@ -115,7 +130,7 @@ func (o *OpenAI) body(req Request, model string, stream, streamUsage, extra bool
 			b["stream_options"] = map[string]any{"include_usage": true}
 		}
 	}
-	applyGeneration(b, o.preset, model, stream)
+	applyGeneration(b, p, model, stream)
 	if o.responsesAPI() {
 		b = responsesBody(b, o.preset.Generation.ExtraBody)
 	}
@@ -181,6 +196,7 @@ func (o *OpenAI) chat(ctx context.Context, req Request) (Response, error) {
 		return b
 	}
 	sent := build()
+	imagesDropped := false
 	resp, err := o.send(ctx, url, sent, model, req.Timeout)
 	// Relax parameters a server rejects, once each: stream_options (older
 	// compatible servers; usage then gets estimated), temperature / top_p
@@ -200,6 +216,8 @@ relax:
 			sampling = false
 		case extra && o.mentionsExtra(detail):
 			extra = false
+		case req.Images != nil && !req.ImagesRequired: // a model that takes no images
+			req.Images, imagesDropped = nil, true
 		default:
 			break relax
 		}
@@ -224,10 +242,68 @@ relax:
 	}
 	out.Provider = o.preset.ID
 	out.Latency = time.Since(start)
+	out.ImagesDropped = imagesDropped
 	if out.FinishReason == FinishFilter && out.Text == "" {
 		return out, newErr(CodeFiltered, "provider", o.preset.ID)
 	}
 	return out, nil
+}
+
+// instructionOffset finds the spoken instruction after Rewrite's source
+// wrappers, whose contents may themselves mention <instruction>.
+func instructionOffset(text string) int {
+	offset := 0
+	for _, tag := range []string{"glossary", "selected_text", "typed_text"} {
+		prefix := "<" + tag + ">\n"
+		if !strings.HasPrefix(text[offset:], prefix) {
+			continue
+		}
+		closing := "\n</" + tag + ">"
+		end := strings.Index(text[offset+len(prefix):], closing)
+		if end < 0 {
+			return -1
+		}
+		offset += len(prefix) + end + len(closing)
+		if strings.HasPrefix(text[offset:], "\n\n") {
+			offset += 2
+		}
+	}
+	if strings.HasPrefix(text[offset:], "<instruction>\n") {
+		return offset
+	}
+	return -1
+}
+
+// withImages is text and JPEGs as one message's content parts, in the
+// API's format. The box's own images go before the spoken instruction.
+func (o *OpenAI) withImages(text string, jpegs [][]byte, beforeInstruction bool) []map[string]any {
+	before, after := text, ""
+	if beforeInstruction {
+		if offset := instructionOffset(text); offset >= 0 {
+			before, after = strings.TrimSuffix(text[:offset], "\n\n"), text[offset:]
+		}
+	}
+	textType, imageType := "text", "image_url"
+	if o.responsesAPI() {
+		textType, imageType = "input_text", "input_image"
+	}
+	parts := make([]map[string]any, 0, len(jpegs)+2)
+	if before != "" {
+		parts = append(parts, map[string]any{"type": textType, "text": before})
+	}
+	for _, jpeg := range jpegs {
+		image := map[string]any{"type": imageType}
+		if o.responsesAPI() {
+			image["image_url"] = "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(jpeg)
+		} else {
+			image["image_url"] = map[string]any{"url": "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(jpeg)}
+		}
+		parts = append(parts, image)
+	}
+	if after != "" {
+		parts = append(parts, map[string]any{"type": textType, "text": after})
+	}
+	return parts
 }
 
 // mentionsExtra reports whether a rejection names one of ExtraBody's keys

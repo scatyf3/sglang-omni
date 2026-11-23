@@ -33,7 +33,9 @@ type harness struct {
 	llm        LLM
 	fallback   LLM // Translate's fallback model (nil: none)
 	resolveErr error
-	logs       []string
+	// speech is Resolve's speech argument, call by call.
+	speech []bool
+	logs   []string
 	// vadModel is the voice activity model the services have (nil: none).
 	vadModel vad.Model
 }
@@ -45,13 +47,17 @@ func newHarness(t *testing.T, prov asr.Provider, model LLM, cfgFn func(*Config, 
 	s.Dictionary.Enabled = true
 	cfg := Config{
 		Audio: h.audio, Text: h.text, History: h.hist,
-		Resolve: func(ctx context.Context, kind Kind, _ settings.Settings) (Services, error) {
+		Resolve: func(ctx context.Context, kind Kind, _ settings.Settings, speech bool) (Services, error) {
 			h.mu.Lock()
 			defer h.mu.Unlock()
+			h.speech = append(h.speech, speech)
 			if h.resolveErr != nil {
 				return Services{}, h.resolveErr
 			}
-			svc := Services{ASR: h.asr, ASRInfo: Model{ID: "doubao", Name: "Doubao", Model: "seed"}, VAD: h.vadModel}
+			var svc Services
+			if speech {
+				svc = Services{ASR: h.asr, ASRInfo: Model{ID: "doubao", Name: "Doubao", Model: "seed"}, VAD: h.vadModel}
+			}
 			if h.llm != nil {
 				svc.LLM, svc.LLMInfo = h.llm, Model{ID: "deepseek", Name: "DeepSeek", Model: "deepseek-chat"}
 			}
@@ -77,6 +83,7 @@ func newHarness(t *testing.T, prov asr.Provider, model LLM, cfgFn func(*Config, 
 	}
 	cfg.Settings = func() settings.Settings { return s }
 	h.m = New(cfg)
+	t.Cleanup(h.m.Close)
 	return h
 }
 
@@ -238,14 +245,14 @@ func TestPipeline(t *testing.T) {
 				if len(reqs) != 1 {
 					t.Fatalf("%d llm requests", len(reqs))
 				}
-				// The system prompt, the clean-up's example turn, the input.
+				// The system prompt and the input, with no example turn.
 				msgs := reqs[0].Messages
 				sys, user := msgs[0].Content, msgs[len(msgs)-1].Content
-				if len(msgs) != 4 || msgs[1].Role != llm.User || msgs[2].Role != llm.Assistant || !strings.Contains(sys, "Be brief.") || !strings.Contains(sys, "- VoxtNew") || strings.Contains(sys, "Off") ||
+				if len(msgs) != 2 || !strings.Contains(sys, "Be brief.") || !strings.Contains(sys, "- VoxtNew") || strings.Contains(sys, "Off") ||
 					strings.Contains(sys, "hello") || user != "<input>\nhello VoxtNew\n</input>" || reqs[0].Skill != llm.SkillTranscribeEnhance {
 					t.Errorf("request %+v", reqs[0])
 				}
-				if end.Profile != "custom:glossary" {
+				if end.Profile != "custom:cleanup+glossary" {
 					t.Errorf("profile %q", end.Profile)
 				}
 			}

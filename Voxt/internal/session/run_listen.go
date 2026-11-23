@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/sgl-project/sglang-omni/Voxt/internal/asr"
 	"github.com/sgl-project/sglang-omni/Voxt/internal/compose"
 	"github.com/sgl-project/sglang-omni/Voxt/internal/helper/proto"
+	"github.com/sgl-project/sglang-omni/Voxt/internal/lang"
 	"github.com/sgl-project/sglang-omni/Voxt/internal/llm"
 	"github.com/sgl-project/sglang-omni/Voxt/internal/store"
 )
@@ -37,7 +39,25 @@ func (r *run) awaitServices() bool {
 // useServices keeps the resolved services.
 func (r *run) useServices(s svcResult) {
 	r.resolved, r.svc, r.terms = true, s.svc, s.terms
-	r.m.update(r, func(sn *Snapshot) { sn.ASR, sn.LLM = s.svc.ASRInfo, s.svc.LLMInfo })
+	close(r.svcResolved)
+	up := uploadLen(s.svc.ASR, r.settings.Audio.UploadMB)
+	r.m.update(r, func(sn *Snapshot) { sn.ASR, sn.LLM, sn.UploadLen = s.svc.ASRInfo, s.svc.LLMInfo, up })
+}
+
+// uploadLen is how much recording fits in one upload to p, under the
+// user's limit of userMB when it is the smaller (0: p splits no uploads).
+func uploadLen(p asr.Provider, userMB int) time.Duration {
+	if p == nil {
+		return 0
+	}
+	most := p.Caps().MaxBytes
+	if u := int64(userMB) << 20; u > 0 && u < most {
+		most = u
+	}
+	if most <= 44 {
+		return 0
+	}
+	return time.Duration(most-44) * time.Second / (2 * asr.SampleRate) // 44: the WAV header
 }
 
 // needs reports what the services lack for the session: a speech
@@ -56,6 +76,7 @@ func (r *run) lacks() *Problem {
 // Rewrite) and puts it in the snapshot; "" for none, or when it could
 // not be read (the session goes on without one).
 func (r *run) readSelection() string {
+	defer r.m.update(r, func(s *Snapshot) { s.ReadingSelection = false })
 	cfg := r.m.cfg
 	timeout, params := cfg.ReadTimeout, proto.SelectionParams{AllowCopy: AllowCopy(r.req.Target.BundleID)}
 	if r.req.Kind == store.KindRewrite {
@@ -71,14 +92,30 @@ func (r *run) readSelection() string {
 		return ""
 	}
 	text := res.Text
-	if strings.TrimSpace(text) == "" {
-		r.logf("info", "no selection (%s, %.0f ms)", res.Via, res.MS)
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		// The helper's steps say which reading found nothing (#3835).
+		r.logf("info", "no selection (%s, %.0f ms; %s)", res.Via, res.MS, strings.Join(res.Steps, ", "))
 		return ""
+	}
+	if r.req.Kind == store.KindRewrite && !r.settings.Privacy.SendClipboardImage {
+		r.clip = nil
+	} else if r.req.Kind == store.KindRewrite {
+		switch {
+		case len(res.Image) > 0 && (trimmed == "[Image]" || r.settings.Privacy.SendClipboardImageWithSelection):
+			// The copy fallback returns the newly selected image before it
+			// restores the clipboard, never an earlier copied image.
+			r.clip = res.Image
+		case trimmed == "[Image]" || !r.settings.Privacy.SendClipboardImageWithSelection:
+			// Text takes the text path by default. A placeholder without a
+			// newly decoded image never revives the earlier clipboard image.
+			r.clip = nil
+		}
 	}
 	for _, t := range r.req.Previous {
 		// A follow-up's: the text selected before, still selected, is in
 		// the conversation already (#3816).
-		if strings.TrimSpace(t.Selection) == strings.TrimSpace(text) {
+		if strings.TrimSpace(t.Selection) == trimmed {
 			r.logf("info", "the selection is in the conversation already")
 			return ""
 		}
@@ -101,7 +138,8 @@ func (r *run) listen() (string, bool) {
 	defer capCancel()
 	capDone := make(chan capResult, 1)
 	go func() {
-		params := proto.CaptureParams{Devices: r.settings.Audio.Devices, SampleRate: asr.SampleRate} // no maxSeconds: a podcast runs until Stop (StopGrace covers a lost stop)
+		// MaxSeconds: the user's length limit only (0: a podcast runs until Stop; StopGrace covers a lost stop).
+		params := proto.CaptureParams{Devices: r.settings.Audio.Devices, SampleRate: asr.SampleRate, MaxSeconds: float64(r.settings.Audio.MaxSeconds)}
 		res, err := cfg.Audio.Record(capCtx, r.id, params, r.onAudio)
 		r.pcm.close()
 		capDone <- capResult{res, err}
@@ -147,7 +185,7 @@ func (r *run) listen() (string, bool) {
 	// Until the speech model's stream is open, the session waits for it
 	// (Snapshot.Waiting, after Config.WaitNote).
 	r.opening.Store(true)
-	waitNote := r.waitTimer(r.m.Current().StartedAt)
+	waitNote := r.waitTimer(r.m.snapshot(r).StartedAt)
 	if waitNote == nil {
 		r.noteWait()
 	}
@@ -249,13 +287,16 @@ func (r *run) listen() (string, bool) {
 	})
 	first := time.Duration(captured.res.FirstFrameMS * float64(time.Millisecond))
 	r.logf("info", "recorded %v (%s, %d frames, %d restarts, first audio after %v from %s)", audioLen.Round(time.Millisecond), captured.res.Reason,
-		captured.res.Frames, captured.res.Restarts, first.Round(time.Millisecond), r.m.Current().Device)
+		captured.res.Frames, captured.res.Restarts, first.Round(time.Millisecond), r.m.snapshot(r).Device)
 	if first > slowMic {
 		r.logf("warning", "the microphone gave its first audio %v after the start: what was said before is not in the recording", first.Round(time.Millisecond))
 	}
 	if audioLen < cfg.MinRecording {
 		if stream != nil {
 			stream.Close()
+		}
+		if r.typedOnly() {
+			return "", true
 		}
 		r.m.end(r, Cancelled, func(s *Snapshot) { s.Problem = &Problem{Code: ProblemTooShort} }, nil)
 		return "", false
@@ -320,6 +361,9 @@ func (r *run) listen() (string, bool) {
 			salvaged = r.salvage(stream)
 		}
 		stream.Close()
+		if silent && r.typedOnly() {
+			return "", true
+		}
 		if silent {
 			// The gate held the whole recording: no speech, nothing sent.
 			r.logf("info", "no speech in %v: nothing sent to %s", audioLen.Round(time.Millisecond), r.svc.ASRInfo.ID)
@@ -330,6 +374,9 @@ func (r *run) listen() (string, bool) {
 		}
 	} else if ft, ok := r.svc.ASR.(asr.FileTranscriber); ok {
 		upload, speech := r.prepare(pcm)
+		if !speech && r.typedOnly() {
+			return "", true
+		}
 		if !speech {
 			r.logf("info", "no speech in %v: not sent to %s", audioLen.Round(time.Millisecond), r.svc.ASRInfo.ID)
 			r.recognitionFailed = true
@@ -339,7 +386,7 @@ func (r *run) listen() (string, bool) {
 		}
 		sent := asr.Duration(upload, asr.SampleRate)
 		r.m.update(r, func(s *Snapshot) { s.Timings.Sent = sent })
-		res, err = ft.Transcribe(actx, asr.FileRequest{Audio: upload, Format: "pcm", SampleRate: asr.SampleRate, Lang: r.speechLang(), Hints: r.hints(), Prompt: r.speechContext()})
+		res, err = ft.Transcribe(actx, asr.FileRequest{Audio: upload, Format: "pcm", SampleRate: asr.SampleRate, Lang: r.speechLang(), Hints: r.hints(), Prompt: r.speechContext(), MaxBytes: r.settings.Audio.UploadMB << 20})
 		if err != nil && actx.Err() != nil {
 			err = r.ctxErr(actx)
 		}
@@ -364,9 +411,12 @@ func (r *run) listen() (string, bool) {
 		r.logf("warning", "going on with the text the live session had: %v", err)
 		res = asr.Result{Text: salvaged}
 	}
-	raw, _ := withoutEndWord(strings.TrimSpace(res.Text), word)
+	raw, _ := withoutEndWord(strings.TrimSpace(r.inScript(res.Text, res.Lang)), word)
 	r.logf("info", "recognised %s in %v", r.logText(raw), asrTime.Round(time.Millisecond))
 	r.m.update(r, func(s *Snapshot) { s.Raw, s.Timings.ASR = raw, asrTime })
+	if raw == "" && r.typedOnly() {
+		return "", true
+	}
 	if raw == "" {
 		r.recognitionFailed = true
 		r.finish(Done, &Problem{Code: ProblemNoSpeech}, "", finishOpts{})
@@ -383,7 +433,7 @@ func (r *run) salvage(st asr.Stream) string {
 			return text
 		}
 	}
-	return strings.TrimSpace(r.m.Current().Partial)
+	return strings.TrimSpace(r.m.snapshot(r).Partial)
 }
 
 // isCancelled reports whether a capture error is the end of a job that
@@ -408,7 +458,7 @@ func (r *run) warmLLM() {
 	var skill llm.Skill
 	switch r.req.Kind {
 	case store.KindTranscribe:
-		if !r.settings.Features.Transcribe.Enhance {
+		if !r.transcribeCleanup() {
 			return
 		}
 		in, skill = r.transcribeInput(""), llm.SkillTranscribeEnhance
@@ -456,4 +506,35 @@ func (r *run) glossary() []compose.Term {
 		}
 	}
 	return out
+}
+
+// typedOnly says whether the input box holds typed text for a recording
+// nothing was heard in: the session goes on, the text its instruction
+// (writeInput), instead of ending with "no speech".
+func (r *run) typedOnly() bool {
+	cfg := r.m.cfg
+	if !r.req.Box || cfg.BoxInput == nil {
+		return false
+	}
+	typed, _, err := cfg.BoxInput(r.ctx)
+	return err == nil && strings.TrimSpace(typed) != ""
+}
+
+// inScript writes recognised Chinese text in the script of dictation
+// (SpeechScript). Text in another language stays as it is, or its kanji
+// would be rewritten: said is the language the speech model reported (""
+// when it did not, as for a stream's partials and pieces), and kana marks
+// Japanese either way.
+func (r *run) inScript(text, said string) string {
+	if c := lang.Canonical(said); c != "" && c != "zh" && c != "yue" {
+		return text
+	}
+	if strings.ContainsFunc(text, func(c rune) bool { return unicode.In(c, unicode.Hiragana, unicode.Katakana) }) {
+		return text
+	}
+	var reads []string
+	if r.m.cfg.Languages != nil {
+		reads = r.m.cfg.Languages()
+	}
+	return lang.RenderChineseScript(text, SpeechScript(r.settings, r.m.cfg.Locale(), reads))
 }
